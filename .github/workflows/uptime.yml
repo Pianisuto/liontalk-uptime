@@ -1,0 +1,72 @@
+# Monitor externo do LionTalk.
+#
+# A cada 15 min confere a página inicial e a emissão de código de login pelo
+# endereço público. Falha → a execução fica vermelha e o GitHub avisa por
+# e-mail quem mantém o agendamento.
+#
+# Segurança: nenhum segredo, nenhuma ação de terceiros e nenhum gatilho por
+# pull request; o token padrão não tem permissão nenhuma, exceto no job
+# semanal que registra atividade (o GitHub desliga agendamentos de
+# repositórios públicos parados há 60 dias).
+name: Uptime
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: uptime-${{ github.event.schedule || 'manual' }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.event.schedule != '17 6 * * 1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Página inicial e API pública
+        env:
+          BASE: https://liontalk.lionslab.dev
+        run: |
+          set -euo pipefail
+          check() {
+            local method="$1" path="$2" want="$3" code
+            for attempt in 1 2 3; do
+              code=$(curl --silent --output /dev/null --max-time 15 \
+                --write-out '%{http_code}' --request "$method" "$BASE$path" || true)
+              [ "$code" = "$want" ] && { echo "ok $method $path"; return 0; }
+              sleep 20
+            done
+            echo "::error::$method $path respondeu $code (esperado $want)"
+            return 1
+          }
+          check GET / 200
+          check POST /v1/auth/nonce 200
+
+  keepalive:
+    if: github.event.schedule == '17 6 * * 1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Registrar atividade se o repositório estiver parado
+        run: |
+          set -euo pipefail
+          last=$(gh api "repos/$REPO/commits?per_page=1" --jq '.[0].commit.committer.date')
+          age=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 ))
+          echo "último commit há $age dias"
+          [ "$age" -ge 45 ] || exit 0
+          sha=$(gh api "repos/$REPO/contents/atividade.txt" --jq .sha)
+          gh api --method PUT "repos/$REPO/contents/atividade.txt" \
+            -f message="Registre atividade para manter o agendamento" \
+            -f content="$(date -u +%FT%TZ | base64)" \
+            -f sha="$sha" > /dev/null
+          echo "atividade registrada"
